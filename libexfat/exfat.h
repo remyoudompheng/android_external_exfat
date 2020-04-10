@@ -4,7 +4,7 @@
 	implementation.
 
 	Free exFAT implementation.
-	Copyright (C) 2010-2016  Andrew Nayenko
+	Copyright (C) 2010-2018  Andrew Nayenko
 
 	This program is free software; you can redistribute it and/or modify
 	it under the terms of the GNU General Public License as published by
@@ -38,22 +38,22 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
-#define EXFAT_NAME_MAX 256
-#define EXFAT_ATTRIB_CONTIGUOUS 0x10000
-#define EXFAT_ATTRIB_CACHED     0x20000
-#define EXFAT_ATTRIB_DIRTY      0x40000
-#define EXFAT_ATTRIB_UNLINKED   0x80000
-#define IS_CONTIGUOUS(node) (((node).flags & EXFAT_ATTRIB_CONTIGUOUS) != 0)
+#define EXFAT_NAME_MAX 255
+/* UTF-16 encodes code points up to U+FFFF as single 16-bit code units.
+   UTF-8 uses up to 3 bytes (i.e. 8-bit code units) to encode code points
+   up to U+FFFF. One additional character is for null terminator. */
+#define EXFAT_UTF8_NAME_BUFFER_MAX (EXFAT_NAME_MAX * 3 + 1)
+#define EXFAT_UTF8_ENAME_BUFFER_MAX (EXFAT_ENAME_MAX * 3 + 1)
+
 #define SECTOR_SIZE(sb) (1 << (sb).sector_bits)
 #define CLUSTER_SIZE(sb) (SECTOR_SIZE(sb) << (sb).spc_bits)
-#define CLUSTER_INVALID(c) \
-	((c) < EXFAT_FIRST_DATA_CLUSTER || (c) > EXFAT_LAST_DATA_CLUSTER)
+#define CLUSTER_INVALID(sb, c) ((c) < EXFAT_FIRST_DATA_CLUSTER || \
+	(c) - EXFAT_FIRST_DATA_CLUSTER >= le32_to_cpu((sb).cluster_count))
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define DIV_ROUND_UP(x, d) (((x) + (d) - 1) / (d))
 #define ROUND_UP(x, d) (DIV_ROUND_UP(x, d) * (d))
-#define UTF8_BYTES(c) ((c) * 6) /* UTF-8 character can occupy up to 6 bytes */
 
 #define BMAP_SIZE(count) (ROUND_UP(count, sizeof(bitmap_t) * 8) / 8)
 #define BMAP_BLOCK(index) ((index) / sizeof(bitmap_t) / 8)
@@ -64,6 +64,9 @@
 	((bitmap)[BMAP_BLOCK(index)] |= BMAP_MASK(index))
 #define BMAP_CLR(bitmap, index) \
 	((bitmap)[BMAP_BLOCK(index)] &= ~BMAP_MASK(index))
+
+#define EXFAT_REPAIR(hook, ef, ...) \
+	(exfat_ask_to_fix(ef) && exfat_fix_ ## hook(ef, __VA_ARGS__))
 
 /* The size of off_t type must be 64 bits. File systems larger than 2 GB will
    be corrupted with 32-bit off_t. */
@@ -79,10 +82,14 @@ struct exfat_node
 	int references;
 	uint32_t fptr_index;
 	cluster_t fptr_cluster;
-	cluster_t entry_cluster;
 	off_t entry_offset;
 	cluster_t start_cluster;
-	int flags;
+	uint16_t attrib;
+	uint8_t continuations;
+	bool is_contiguous : 1;
+	bool is_cached : 1;
+	bool is_dirty : 1;
+	bool is_unlinked : 1;
 	uint64_t size;
 	time_t mtime, atime;
 	le16_t name[EXFAT_NAME_MAX + 1];
@@ -112,13 +119,14 @@ struct exfat
 		bool dirty;
 	}
 	cmap;
-	char label[UTF8_BYTES(EXFAT_ENAME_MAX) + 1];
+	char label[EXFAT_UTF8_ENAME_BUFFER_MAX];
 	void* zero_cluster;
 	int dmask, fmask;
 	uid_t uid;
 	gid_t gid;
 	int ro;
 	bool noatime;
+	enum { EXFAT_REPAIR_NO, EXFAT_REPAIR_ASK, EXFAT_REPAIR_YES } repair;
 };
 
 /* in-core nodes iterator */
@@ -135,6 +143,7 @@ struct exfat_human_bytes
 };
 
 extern int exfat_errors;
+extern int exfat_errors_fixed;
 
 void exfat_bug(const char* format, ...) PRINTF NORETURN;
 void exfat_error(const char* format, ...) PRINTF;
@@ -161,7 +170,7 @@ ssize_t exfat_generic_pwrite(struct exfat* ef, struct exfat_node* node,
 int exfat_opendir(struct exfat* ef, struct exfat_node* dir,
 		struct exfat_iterator* it);
 void exfat_closedir(struct exfat* ef, struct exfat_iterator* it);
-struct exfat_node* exfat_readdir(struct exfat* ef, struct exfat_iterator* it);
+struct exfat_node* exfat_readdir(struct exfat_iterator* it);
 int exfat_lookup(struct exfat* ef, struct exfat_node** node,
 		const char* path);
 int exfat_split(struct exfat* ef, struct exfat_node** parent,
@@ -181,14 +190,15 @@ int exfat_find_used_sectors(const struct exfat* ef, off_t* a, off_t* b);
 
 void exfat_stat(const struct exfat* ef, const struct exfat_node* node,
 		struct stat* stbuf);
-void exfat_get_name(const struct exfat_node* node, char* buffer, size_t n);
+void exfat_get_name(const struct exfat_node* node,
+		char buffer[EXFAT_UTF8_NAME_BUFFER_MAX]);
 uint16_t exfat_start_checksum(const struct exfat_entry_meta1* entry);
 uint16_t exfat_add_checksum(const void* entry, uint16_t sum);
-le16_t exfat_calc_checksum(const struct exfat_entry_meta1* meta1,
-		const struct exfat_entry_meta2* meta2, const le16_t* name);
+le16_t exfat_calc_checksum(const struct exfat_entry* entries, int n);
 uint32_t exfat_vbr_start_checksum(const void* sector, size_t size);
 uint32_t exfat_vbr_add_checksum(const void* sector, size_t size, uint32_t sum);
-le16_t exfat_calc_name_hash(const struct exfat* ef, const le16_t* name);
+le16_t exfat_calc_name_hash(const struct exfat* ef, const le16_t* name,
+		size_t length);
 void exfat_humanize_bytes(uint64_t value, struct exfat_human_bytes* hb);
 void exfat_print_info(const struct exfat_super_block* sb,
 		uint32_t free_clusters);
@@ -217,5 +227,13 @@ time_t exfat_exfat2unix(le16_t date, le16_t time, uint8_t centisec);
 void exfat_unix2exfat(time_t unix_time, le16_t* date, le16_t* time,
 		uint8_t* centisec);
 void exfat_tzset(void);
+
+bool exfat_ask_to_fix(const struct exfat* ef);
+bool exfat_fix_invalid_vbr_checksum(const struct exfat* ef, void* sector,
+		uint32_t vbr_checksum);
+bool exfat_fix_invalid_node_checksum(const struct exfat* ef,
+		struct exfat_node* node);
+bool exfat_fix_unknown_entry(struct exfat* ef, struct exfat_node* dir,
+		const struct exfat_entry* entry, off_t offset);
 
 #endif /* ifndef EXFAT_H_INCLUDED */
